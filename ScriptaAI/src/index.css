@@ -1,0 +1,50 @@
+@import "tailwindcss";
+
+@theme {
+  --color-primary: #06d0f9;
+  --color-background-light: #f5f8f8;
+  --color-background-dark: #0f1f23;
+
+  --font-display: "Space Grotesk", sans-serif;
+
+  --radius-default: 1rem;
+  --radius-lg: 2rem;
+  --radius-xl: 3rem;
+}
+
+/* Enable class-based dark mode in v4 */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ── Custom Scrollbar ── */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.15);
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.3);
+}
+
+/* Firefox */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.15) transparent;
+}
+
+/* Textarea specific - slightly more visible */
+textarea::-webkit-scrollbar-thumb {
+  background: rgba(6, 208, 249, 0.15);
+}
+
+textarea::-webkit-scrollbar-thumb:hover {
+  background: rgba(6, 208, 249, 0.3);
+}
