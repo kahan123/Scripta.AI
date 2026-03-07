@@ -4,6 +4,7 @@ const dotenv = require('dotenv');
 const axios = require('axios');
 const path = require('path');
 const fs = require('fs');
+const siliconKeys = require('./siliconKeys');
 
 dotenv.config({ override: true });
 
@@ -117,13 +118,13 @@ app.post('/api/generate-video', async (req, res) => {
         }
 
         // 2. Generate Video via SiliconFlow (Wan-AI/Wan2.2-I2V-A14B)
-        const siliconflowApiKey = process.env.SILICONFLOW_API_KEY;
+        let siliconflowApiKey = siliconKeys.getKey();
+
         if (!siliconflowApiKey) {
-            return res.json({
-                success: true,
-                message: 'Image generated. SILICONFLOW_API_KEY missing.',
-                imageUrl: imageUrl,
-                videoUrl: null
+            return res.status(402).json({
+                error: 'SiliconFlow keys exhausted',
+                instructions: 'Please go to https://cloud.siliconflow.cn/ to create a new key, then paste it here.',
+                needsKey: true
             });
         }
 
@@ -196,8 +197,22 @@ app.post('/api/generate-video', async (req, res) => {
     } catch (error) {
         const errorDetail = error.response?.data || error.message;
         console.error("Generation error:", errorDetail);
-        res.status(500).json({ error: 'Failed to generate video' });
+
+        if (error.response?.status === 402 || (typeof errorDetail === 'string' && errorDetail.includes('balance is insufficient'))) {
+            console.log("[KeyManager] Insufficient balance detected. Rotating key...");
+            siliconKeys.rotateKey();
+        }
+
+        res.status(500).json({ error: 'Failed to generate video', details: errorDetail });
     }
+});
+
+// Route to manually update SiliconFlow key if exhausted
+app.post('/api/update-silicon-key', (req, res) => {
+    const { key } = req.body;
+    if (!key) return res.status(400).json({ error: 'Key is required' });
+    siliconKeys.setUserKey(key);
+    res.json({ success: true, message: 'SiliconFlow key updated successfully.' });
 });
 
 // Route for the Scripta AI Chat Bot Assistant
@@ -426,7 +441,15 @@ app.post('/api/breakdown-storyboard', async (req, res) => {
 app.post('/api/generate-scene-visuals', async (req, res) => {
     const { scenes } = req.body;
     const hfToken = process.env.HF_TOKEN;
-    const siliconFlowKey = process.env.SILICONFLOW_API_KEY;
+    const siliconFlowKey = siliconKeys.getKey();
+
+    if (siliconKeys.isExhausted()) {
+        return res.status(402).json({
+            error: 'SiliconFlow keys exhausted',
+            instructions: 'Please go to https://cloud.siliconflow.cn/ to create a new API key and provide it in the settings.',
+            needsKey: true
+        });
+    }
 
     if (!scenes || !Array.isArray(scenes)) {
         return res.status(400).json({ error: 'Scenes array is required' });
@@ -597,12 +620,15 @@ STRICT RULE: Output ONLY the motion instructions. No narration, no "Scene X", no
             console.error(`[Job ${jobId}] Critical Error:`, errorDetail);
 
             let displayError = error.message;
-            if (error.response?.data?.message?.includes('balance is insufficient')) {
-                displayError = "SiliconFlow API balance is insufficient. Please top up your account.";
+            if (error.response?.status === 402 || (typeof errorDetail === 'string' && errorDetail.includes('balance is insufficient'))) {
+                displayError = "SiliconFlow API balance is insufficient. Rotating key in background...";
+                console.log(`[Job ${jobId}] Data shows 402. Rotating key...`);
+                siliconKeys.rotateKey();
             }
 
             generationStatus[jobId].status = 'failed';
             generationStatus[jobId].error = displayError;
+            generationStatus[jobId].needsKey = siliconKeys.isExhausted();
         }
     })();
 
@@ -626,7 +652,15 @@ app.post('/api/regenerate-scene-video', async (req, res) => {
     console.log(`[Regenerate] Starting video regeneration for scene ${sceneId}...`);
 
     try {
-        const siliconFlowKey = process.env.SILICONFLOW_API_KEY;
+        const siliconFlowKey = siliconKeys.getKey();
+
+        if (siliconKeys.isExhausted()) {
+            return res.status(402).json({
+                error: 'SiliconFlow keys exhausted',
+                instructions: 'Please go to https://cloud.siliconflow.cn/ to create a new API key and provide it here.',
+                needsKey: true
+            });
+        }
 
         // 1. Get image as base64
         const imgRes = await axios.get(imageUrl, { responseType: 'arraybuffer' });
@@ -682,8 +716,18 @@ app.post('/api/regenerate-scene-video', async (req, res) => {
         res.json({ videoUrl: localVidUrl, vidFileName });
 
     } catch (error) {
-        console.error("[Regenerate] Error:", error.response?.data || error.message);
-        res.status(500).json({ error: error.message });
+        const errorDetail = error.response?.data || error.message;
+        console.error("[Regenerate] Error:", errorDetail);
+
+        if (error.response?.status === 402 || (typeof errorDetail === 'string' && errorDetail.includes('balance is insufficient'))) {
+            console.log("[KeyManager] Insufficient balance detected during regeneration. Rotating key...");
+            siliconKeys.rotateKey();
+        }
+
+        res.status(500).json({
+            error: error.message,
+            needsKey: siliconKeys.isExhausted()
+        });
     }
 });
 
