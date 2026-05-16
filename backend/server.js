@@ -4,21 +4,71 @@ const dotenv = require('dotenv');
 const axios = require('axios');
 const path = require('path');
 const fs = require('fs');
-const siliconKeys = require('./siliconKeys');
+const multer = require('multer');
+const pdf = require('pdf-parse');
+// const siliconKeys = require('./siliconKeys'); // Removed key rotation logic
+
 
 dotenv.config({ override: true });
+
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+
 app.use(cors());
 app.use(express.json());
+
+// Configure multer for PDF uploads (memory storage)
+const storage = multer.memoryStorage();
+const upload = multer({
+    storage: storage,
+    limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
+});
 
 // In-memory status store for progress tracking
 const generationStatus = {};
 
 app.use('/generated-images', express.static(path.join(__dirname, 'public/generated-images')));
 app.use('/generated-videos', express.static(path.join(__dirname, 'public/generated-videos')));
+
+// Enhanced axios wrapper with retry logic for transient errors
+const axiosWithRetry = async (url, options = {}, maxRetries = 3) => {
+    let retries = 0;
+    while (retries <= maxRetries) {
+        try {
+            const method = options.method?.toLowerCase() || 'get';
+            const config = {
+                ...options,
+                url,
+                method,
+                timeout: options.timeout || 60000 // 60s default timeout
+            };
+            return await axios(config);
+        } catch (err) {
+            const isRetryable = (
+                err.code === 'ECONNRESET' ||
+                err.code === 'ETIMEDOUT' ||
+                err.code === 'ECONNABORTED' ||
+                (err.response && [502, 503, 504].includes(err.response.status))
+            );
+
+            if (isRetryable && retries < maxRetries) {
+                retries++;
+                const delay = Math.pow(2, retries) * 1000; // Exponential backoff
+                console.warn(`[Retry] Attempt ${retries}/${maxRetries} for ${url} due to ${err.code || err.response?.status}. Retrying in ${delay}ms...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+            } else {
+                if (err.response) {
+                    console.error(`[Axios Error] ${url} - Status: ${err.response.status}, Data:`, JSON.stringify(err.response.data).substring(0, 500));
+                } else {
+                    console.error(`[Axios Error] ${url} - Message: ${err.message}`);
+                }
+                throw err;
+            }
+        }
+    }
+};
 
 // Helper function to poll AI Horde
 const pollHorde = async (id, apikey) => {
@@ -118,12 +168,11 @@ app.post('/api/generate-video', async (req, res) => {
         }
 
         // 2. Generate Video via SiliconFlow (Wan-AI/Wan2.2-I2V-A14B)
-        let siliconflowApiKey = siliconKeys.getKey();
+        const siliconflowApiKey = process.env.SILICONFLOW_API_KEY;
 
         if (!siliconflowApiKey) {
             return res.status(402).json({
-                error: 'SiliconFlow keys exhausted',
-                instructions: 'Please go to https://cloud.siliconflow.cn/ to create a new key, then paste it here.',
+                error: 'SiliconFlow API key missing in .env',
                 needsKey: true
             });
         }
@@ -198,22 +247,12 @@ app.post('/api/generate-video', async (req, res) => {
         const errorDetail = error.response?.data || error.message;
         console.error("Generation error:", errorDetail);
 
-        if (error.response?.status === 402 || (typeof errorDetail === 'string' && errorDetail.includes('balance is insufficient'))) {
-            console.log("[KeyManager] Insufficient balance detected. Rotating key...");
-            siliconKeys.rotateKey();
-        }
-
         res.status(500).json({ error: 'Failed to generate video', details: errorDetail });
     }
 });
 
-// Route to manually update SiliconFlow key if exhausted
-app.post('/api/update-silicon-key', (req, res) => {
-    const { key } = req.body;
-    if (!key) return res.status(400).json({ error: 'Key is required' });
-    siliconKeys.setUserKey(key);
-    res.json({ success: true, message: 'SiliconFlow key updated successfully.' });
-});
+// Route to handle chat assistant (kept as is)
+
 
 // Route for the Scripta AI Chat Bot Assistant
 app.post('/api/chat-assistant', async (req, res) => {
@@ -231,7 +270,6 @@ app.post('/api/chat-assistant', async (req, res) => {
         if (mode === 'storyboard') {
             systemPrompt = `You are "Scripta AI Chat Bot", a professional cinematic script consultant.
             IMPORTANT: You MUST respond ONLY with a JSON object. No conversational filler outside the JSON.
-            CRITICAL: Any double quotes (") inside the data strings MUST be escaped as \\" to ensure valid JSON.
             
             The user is writing a script/storyboard for a video.
             Your task is to refine the script based on their request.
@@ -249,7 +287,6 @@ app.post('/api/chat-assistant', async (req, res) => {
         } else {
             systemPrompt = `You are "Scripta AI Chat Bot", a professional storyboard director.
             IMPORTANT: You MUST respond ONLY with a JSON object. No conversational filler outside the JSON.
-            CRITICAL: Any double quotes (") inside the data strings MUST be escaped as \\" to ensure valid JSON.
 
             The user has 4 scenes for their video.
             Your task is to refine these scenes (narration, visualPrompt, videoPrompt) based on their request.
@@ -323,6 +360,92 @@ app.post('/api/chat-assistant', async (req, res) => {
     } catch (error) {
         console.error("Chat Assistant error:", error.response?.data || error.message);
         res.status(500).json({ error: 'Failed to process chat request' });
+    }
+});
+
+// Route to parse research paper PDF and generate a structured storyboard
+app.post('/api/parse-pdf', upload.single('paper'), async (req, res) => {
+    if (!req.file) {
+        return res.status(400).json({ error: 'No PDF file uploaded' });
+    }
+
+    console.log(`[PDF] Received PDF file: ${req.file.originalname} (${req.file.size} bytes)`);
+
+    try {
+        // 1. Extract raw text from PDF
+        const data = await pdf(req.file.buffer);
+        const rawText = data.text;
+
+        console.log(`[PDF] Extracted ${rawText.length} characters of text.`);
+
+        // 2. Use LLM to identify structure and generate cinematic storyboard
+        const hfToken = process.env.HF_TOKEN;
+
+        const systemPrompt = `System Role: You are an expert Academic Presentation Writer and Technical Communicator. Your task is to transform dense documents into a clear, structured presentation script or video storyboard.
+
+Task: Analyze the provided [Document Type: e.g., Research Paper / Article] and summarize it into a presentation script. 
+
+Strict Output Formatting Rules:
+You MUST follow this exact structural template. Do not use markdown code blocks, bolding, or asterisks. Use exact line breaks as shown in the template below.
+
+Template to follow:
+Script
+Opening
+[Write a 3-4 sentence introductory paragraph setting the context and introducing the core topic].
+
+Slides
+
+Slide 1
+[Slide Title]
+[Write a 2-3 sentence narration explaining the problem or background].
+
+Slide 2
+Technical
+[Slide Title]
+[Write a 2-3 sentence narration explaining the methodology or approach].
+
+[Continue for Slide 3, Slide 4, Slide 5, etc., including the "Technical" tag on a new line above the title if the slide discusses methodology, architecture, or data.]
+
+Slide [Final Number]
+[Slide Title]
+[Write a 2-3 sentence narration explaining the future directions or impact].
+
+Closing
+[Write a 3-4 sentence concluding paragraph summarizing the overall value and final thoughts].`;
+
+        console.log(`[PDF] Sending extracted text to LLM for structured storyboard generation...`);
+
+        const response = await axios.post(
+            'https://router.huggingface.co/v1/chat/completions',
+            {
+                model: "Qwen/Qwen2.5-72B-Instruct",
+                messages: [
+                    { role: "system", content: systemPrompt },
+                    { role: "user", content: `Here is the research paper text stage (truncated if too long):\n\n${rawText.substring(0, 15000)}` }
+                ],
+                max_tokens: 1500,
+                temperature: 0.3
+            },
+            {
+                headers: {
+                    'Authorization': `Bearer ${hfToken}`,
+                    'Content-Type': 'application/json'
+                }
+            }
+        );
+
+        const storyboardText = response.data.choices[0].message.content;
+        console.log(`[PDF] Structured storyboard generated successfully.`);
+
+        res.json({
+            success: true,
+            storyboard: storyboardText,
+            fileName: req.file.originalname
+        });
+
+    } catch (error) {
+        console.error("PDF Processing error:", error.message);
+        res.status(500).json({ error: 'Failed to process PDF research paper', details: error.message });
     }
 });
 
@@ -441,12 +564,11 @@ app.post('/api/breakdown-storyboard', async (req, res) => {
 app.post('/api/generate-scene-visuals', async (req, res) => {
     const { scenes } = req.body;
     const hfToken = process.env.HF_TOKEN;
-    const siliconFlowKey = siliconKeys.getKey();
+    const siliconFlowKey = process.env.SILICONFLOW_API_KEY;
 
-    if (siliconKeys.isExhausted()) {
+    if (!siliconFlowKey) {
         return res.status(402).json({
-            error: 'SiliconFlow keys exhausted',
-            instructions: 'Please go to https://cloud.siliconflow.cn/ to create a new API key and provide it in the settings.',
+            error: 'SiliconFlow API key missing in .env',
             needsKey: true
         });
     }
@@ -484,15 +606,19 @@ ${isSubsequent ? 'CONTINUITY RULE: This is a subsequent scene. Ensure characters
 
 Output only the refined prompt for the image generator (FLUX). No conversational filler.`;
 
-                console.log(`[Job ${jobId}] Scene ${i + 1} - Sending to LLM for Image Refinement...`);
-                const imgRefRes = await axios.post('https://router.huggingface.co/v1/chat/completions', {
-                    model: "Qwen/Qwen2.5-72B-Instruct",
-                    messages: [{ role: "user", content: imgRefPrompt }],
-                    max_tokens: 300
-                }, { headers: { 'Authorization': `Bearer ${hfToken}` } });
+                console.log(`[Job ${jobId}] [${new Date().toISOString()}] Scene ${i + 1} - Sending to LLM for Image Refinement...`);
+                const imgRefRes = await axiosWithRetry('https://router.huggingface.co/v1/chat/completions', {
+                    method: 'post',
+                    data: {
+                        model: "Qwen/Qwen2.5-72B-Instruct",
+                        messages: [{ role: "user", content: imgRefPrompt }],
+                        max_tokens: 300
+                    },
+                    headers: { 'Authorization': `Bearer ${hfToken}` }
+                });
 
                 const refinedImagePrompt = imgRefRes.data.choices[0].message.content.trim();
-                console.log(`[Job ${jobId}] Scene ${i + 1} Refined Image Prompt:`, refinedImagePrompt);
+                console.log(`[Job ${jobId}] [${new Date().toISOString()}] Scene ${i + 1} Refined Image Prompt:`, refinedImagePrompt);
                 visualContext = refinedImagePrompt;
 
                 const sfImgPayload = {
@@ -506,15 +632,20 @@ Output only the refined prompt for the image generator (FLUX). No conversational
                 if (lastImageBase64) {
                     sfImgPayload.image = lastImageBase64;
                 }
-                console.log(siliconFlowKey)
-                const sfImgRes = await axios.post('https://api.siliconflow.com/v1/images/generations', sfImgPayload, {
+
+                console.log(`[Job ${jobId}] [${new Date().toISOString()}] Scene ${i + 1} - Generating Image via SiliconFlow...`);
+                const sfImgRes = await axiosWithRetry('https://api.siliconflow.com/v1/images/generations', {
+                    method: 'post',
+                    data: sfImgPayload,
                     headers: { 'Authorization': `Bearer ${siliconFlowKey}` }
                 });
 
                 const imgUrl = sfImgRes.data.images[0].url;
                 const imgFileName = `scene_${i + 1}_${timestamp}.webp`;
                 const imgPath = path.join(__dirname, 'public/generated-images', imgFileName);
-                const imgRes = await axios.get(imgUrl, { responseType: 'arraybuffer' });
+
+                console.log(`[Job ${jobId}] [${new Date().toISOString()}] Scene ${i + 1} - Downloading image from ${imgUrl.substring(0, 50)}...`);
+                const imgRes = await axiosWithRetry(imgUrl, { responseType: 'arraybuffer' });
                 fs.writeFileSync(imgPath, Buffer.from(imgRes.data));
                 const localImgUrl = `http://localhost:5000/generated-images/${imgFileName}`;
 
@@ -530,11 +661,16 @@ Previous Motion (for context only): ${motionContext || 'None'}
 
 STRICT RULE: Output ONLY the motion instructions. No narration, no "Scene X", no conversational filler. Keep it under 200 characters if possible.`;
 
-                const vidRefRes = await axios.post('https://router.huggingface.co/v1/chat/completions', {
-                    model: "Qwen/Qwen2.5-72B-Instruct",
-                    messages: [{ role: "user", content: vidRefPrompt }],
-                    max_tokens: 150
-                }, { headers: { 'Authorization': `Bearer ${hfToken}` } });
+                console.log(`[Job ${jobId}] [${new Date().toISOString()}] Scene ${i + 1} - Sending to LLM for Video Refinement...`);
+                const vidRefRes = await axiosWithRetry('https://router.huggingface.co/v1/chat/completions', {
+                    method: 'post',
+                    data: {
+                        model: "Qwen/Qwen2.5-72B-Instruct",
+                        messages: [{ role: "user", content: vidRefPrompt }],
+                        max_tokens: 150
+                    },
+                    headers: { 'Authorization': `Bearer ${hfToken}` }
+                });
 
                 let refinedVideoPrompt = (vidRefRes.data.choices && vidRefRes.data.choices[0])
                     ? vidRefRes.data.choices[0].message.content.trim()
@@ -556,13 +692,17 @@ STRICT RULE: Output ONLY the motion instructions. No narration, no "Scene X", no
                 // Add a small delay before video submission to ensure stability
                 if (isSubsequent) await new Promise(r => setTimeout(r, 5000));
 
-                console.log(`[Job ${jobId}] Scene ${i + 1} - Submitting Video Job with prompt: "${refinedVideoPrompt.substring(0, 50)}..."`);
-                const sfVidSubmit = await axios.post('https://api.siliconflow.com/v1/video/submit', {
-                    model: 'Wan-AI/Wan2.2-I2V-A14B',
-                    prompt: refinedVideoPrompt,
-                    image: base64Img,
-                    image_size: '1280x720' // Supported dimension
-                }, { headers: { 'Authorization': `Bearer ${siliconFlowKey}` } });
+                console.log(`[Job ${jobId}] [${new Date().toISOString()}] Scene ${i + 1} - Submitting Video Job with prompt: "${refinedVideoPrompt.substring(0, 50)}..."`);
+                const sfVidSubmit = await axiosWithRetry('https://api.siliconflow.com/v1/video/submit', {
+                    method: 'post',
+                    data: {
+                        model: 'Wan-AI/Wan2.2-I2V-A14B',
+                        prompt: refinedVideoPrompt,
+                        image: base64Img,
+                        image_size: '1280x720' // Supported dimension
+                    },
+                    headers: { 'Authorization': `Bearer ${siliconFlowKey}` }
+                });
 
                 console.log(`[Job ${jobId}] Scene ${i + 1} - Submission Success:`, sfVidSubmit.data);
                 const reqId = sfVidSubmit.data.requestId || sfVidSubmit.data.id;
@@ -570,7 +710,9 @@ STRICT RULE: Output ONLY the motion instructions. No narration, no "Scene X", no
                 let finalVidUrl = null;
                 while (true) {
                     await new Promise(r => setTimeout(r, 10000)); // Increase poll interval to 10s
-                    const statusRes = await axios.post('https://api.siliconflow.com/v1/video/status', { requestId: reqId }, {
+                    const statusRes = await axiosWithRetry('https://api.siliconflow.com/v1/video/status', {
+                        method: 'post',
+                        data: { requestId: reqId },
                         headers: { 'Authorization': `Bearer ${siliconFlowKey}` }
                     });
 
@@ -590,7 +732,9 @@ STRICT RULE: Output ONLY the motion instructions. No narration, no "Scene X", no
 
                 const vidFileName = `scene_${i + 1}_${timestamp}.mp4`;
                 const vidPath = path.join(__dirname, 'public/generated-videos', vidFileName);
-                const vidDownloadRes = await axios.get(finalVidUrl, { responseType: 'arraybuffer' });
+
+                console.log(`[Job ${jobId}] [${new Date().toISOString()}] Scene ${i + 1} - Downloading video from ${finalVidUrl.substring(0, 50)}...`);
+                const vidDownloadRes = await axiosWithRetry(finalVidUrl, { responseType: 'arraybuffer' });
                 fs.writeFileSync(vidPath, Buffer.from(vidDownloadRes.data));
                 const localVidUrl = `http://localhost:5000/generated-videos/${vidFileName}`;
 
@@ -619,16 +763,8 @@ STRICT RULE: Output ONLY the motion instructions. No narration, no "Scene X", no
             const errorDetail = error.response?.data || error.message;
             console.error(`[Job ${jobId}] Critical Error:`, errorDetail);
 
-            let displayError = error.message;
-            if (error.response?.status === 402 || (typeof errorDetail === 'string' && errorDetail.includes('balance is insufficient'))) {
-                displayError = "SiliconFlow API balance is insufficient. Rotating key in background...";
-                console.log(`[Job ${jobId}] Data shows 402. Rotating key...`);
-                siliconKeys.rotateKey();
-            }
-
             generationStatus[jobId].status = 'failed';
-            generationStatus[jobId].error = displayError;
-            generationStatus[jobId].needsKey = siliconKeys.isExhausted();
+            generationStatus[jobId].error = errorDetail;
         }
     })();
 
@@ -652,31 +788,35 @@ app.post('/api/regenerate-scene-video', async (req, res) => {
     console.log(`[Regenerate] Starting video regeneration for scene ${sceneId}...`);
 
     try {
-        const siliconFlowKey = siliconKeys.getKey();
+        const siliconFlowKey = process.env.SILICONFLOW_API_KEY;
 
-        if (siliconKeys.isExhausted()) {
+        if (!siliconFlowKey) {
             return res.status(402).json({
-                error: 'SiliconFlow keys exhausted',
-                instructions: 'Please go to https://cloud.siliconflow.cn/ to create a new API key and provide it here.',
+                error: 'SiliconFlow API key missing in .env',
                 needsKey: true
             });
         }
 
         // 1. Get image as base64
-        const imgRes = await axios.get(imageUrl, { responseType: 'arraybuffer' });
+        console.log(`[Regenerate] [${new Date().toISOString()}] Fetching image: ${imageUrl}`);
+        const imgRes = await axiosWithRetry(imageUrl, { responseType: 'arraybuffer' });
         const base64Img = `data:image/webp;base64,${Buffer.from(imgRes.data).toString('base64')}`;
 
         // 2. Submit to SiliconFlow
-        console.log(`[Regenerate] Submitting to SiliconFlow...`);
-        const sfVidSubmit = await axios.post('https://api.siliconflow.com/v1/video/submit', {
-            model: 'Wan-AI/Wan2.2-I2V-A14B',
-            prompt: videoPrompt,
-            image: base64Img,
-            image_size: '1280x720'
-        }, { headers: { 'Authorization': `Bearer ${siliconFlowKey}` } });
+        console.log(`[Regenerate] [${new Date().toISOString()}] Submitting to SiliconFlow...`);
+        const sfVidSubmit = await axiosWithRetry('https://api.siliconflow.com/v1/video/submit', {
+            method: 'post',
+            data: {
+                model: 'Wan-AI/Wan2.2-I2V-A14B',
+                prompt: videoPrompt,
+                image: base64Img,
+                image_size: '1280x720'
+            },
+            headers: { 'Authorization': `Bearer ${siliconFlowKey}` }
+        });
 
         const reqId = sfVidSubmit.data.requestId || sfVidSubmit.data.id;
-        console.log(`[Regenerate] Job submitted. ID: ${reqId}`);
+        console.log(`[Regenerate] [${new Date().toISOString()}] Job submitted. ID: ${reqId}`);
 
         // 3. Polling
         let finalVidUrl = null;
@@ -687,12 +827,14 @@ app.post('/api/regenerate-scene-video', async (req, res) => {
             await new Promise(r => setTimeout(r, 10000));
             attempts++;
 
-            const statusRes = await axios.post('https://api.siliconflow.com/v1/video/status', { requestId: reqId }, {
+            const statusRes = await axiosWithRetry('https://api.siliconflow.com/v1/video/status', {
+                method: 'post',
+                data: { requestId: reqId },
                 headers: { 'Authorization': `Bearer ${siliconFlowKey}` }
             });
 
             const currentStatus = statusRes.data.status?.toLowerCase();
-            console.log(`[Regenerate] Status attempt ${attempts}: ${currentStatus}`);
+            console.log(`[Regenerate] [${new Date().toISOString()}] Status attempt ${attempts}: ${currentStatus}`);
 
             if (currentStatus === 'succeed') {
                 finalVidUrl = statusRes.data.results?.videos?.[0]?.url || statusRes.data.video_url || statusRes.data.output_url;
@@ -708,7 +850,9 @@ app.post('/api/regenerate-scene-video', async (req, res) => {
         const timestamp = Date.now();
         const vidFileName = `regen_${sceneId}_${timestamp}.mp4`;
         const vidPath = path.join(__dirname, 'public/generated-videos', vidFileName);
-        const vidDownloadRes = await axios.get(finalVidUrl, { responseType: 'arraybuffer' });
+
+        console.log(`[Regenerate] [${new Date().toISOString()}] Downloading video from ${finalVidUrl.substring(0, 50)}...`);
+        const vidDownloadRes = await axiosWithRetry(finalVidUrl, { responseType: 'arraybuffer' });
         fs.writeFileSync(vidPath, Buffer.from(vidDownloadRes.data));
         const localVidUrl = `http://localhost:5000/generated-videos/${vidFileName}`;
 
@@ -719,14 +863,8 @@ app.post('/api/regenerate-scene-video', async (req, res) => {
         const errorDetail = error.response?.data || error.message;
         console.error("[Regenerate] Error:", errorDetail);
 
-        if (error.response?.status === 402 || (typeof errorDetail === 'string' && errorDetail.includes('balance is insufficient'))) {
-            console.log("[KeyManager] Insufficient balance detected during regeneration. Rotating key...");
-            siliconKeys.rotateKey();
-        }
-
         res.status(500).json({
-            error: error.message,
-            needsKey: siliconKeys.isExhausted()
+            error: error.message
         });
     }
 });

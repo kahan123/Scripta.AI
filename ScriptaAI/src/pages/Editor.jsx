@@ -1,5 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
+import axios from 'axios';
 import ProgressTracker from '../components/ProgressTracker';
 import { mockScenes as initialScenes, TOTAL_DURATION } from '../data/mockData';
 
@@ -1654,7 +1655,7 @@ const TextEditorModal = ({ initialText, onSave, onClose }) => {
     );
 };
 
-const InteractionLayer = ({ scene, updateScene, transformData, setTransformData }) => {
+const InteractionLayer = ({ scene, transformData, setTransformData }) => {
     const layerRef = useRef(null);
 
     const handleInteractionStart = (e, type) => {

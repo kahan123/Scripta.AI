@@ -11,6 +11,7 @@ const Storyboard = () => {
     const navigate = useNavigate();
     const location = useLocation();
     const promptFromState = location.state?.prompt || '';
+    const scriptFromState = location.state?.script || '';
 
     const [phase, setPhase] = useState('script'); // 'script' | 'animating' | 'scenes'
     const [script, setScript] = useState('');
@@ -27,6 +28,13 @@ const Storyboard = () => {
     useEffect(() => {
         const generateInitialStoryboard = async () => {
             if (hasRequestedInitial.current) return;
+
+            if (scriptFromState) {
+                setScript(scriptFromState);
+                setIsGeneratingScript(false);
+                return;
+            }
+
             if (!promptFromState) {
                 setScript("No prompt provided. Please go back to the home page or type a script here.");
                 return;
@@ -48,7 +56,7 @@ const Storyboard = () => {
 
         generateInitialStoryboard();
         hasRequestedInitial.current = true;
-    }, [promptFromState]);
+    }, [promptFromState, scriptFromState]);
 
     // Entrance animation for the script box
     useGSAP(() => {

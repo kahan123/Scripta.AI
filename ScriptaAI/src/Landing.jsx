@@ -1,13 +1,53 @@
 import { useState, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
+import axios from 'axios'
 import gsap from 'gsap'
 import { useGSAP } from '@gsap/react'
 import InteractiveBackground from './components/InteractiveBackground'
 
 function LandingPage() {
-  const [inputValue, setInputValue] = useState('')
   const containerRef = useRef(null)
+  const fileInputRef = useRef(null)
   const navigate = useNavigate()
+  const [isUploading, setIsUploading] = useState(false)
+  const [selectedFileName, setSelectedFileName] = useState('')
+  const [inputValue, setInputValue] = useState('')
+
+  const handleFileChange = (e) => {
+    const file = e.target.files[0];
+    if (file && file.type === 'application/pdf') {
+      setSelectedFileName(file.name);
+      handleFileUpload(file);
+    } else if (file) {
+      alert("Please upload a PDF file.");
+    }
+  };
+
+  const handleFileUpload = async (file) => {
+    setIsUploading(true);
+    const formData = new FormData();
+    formData.append('paper', file);
+
+    try {
+      const response = await axios.post('http://localhost:5000/api/parse-pdf', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' }
+      });
+
+      if (response.data.success) {
+        navigate('/storyboard', {
+          state: {
+            prompt: `Research Paper: ${file.name}`,
+            script: response.data.storyboard
+          }
+        });
+      }
+    } catch (error) {
+      console.error("Upload error:", error);
+      alert("Failed to process research paper. Please try again.");
+    } finally {
+      setIsUploading(false);
+    }
+  };
 
   useGSAP(() => {
     const tl = gsap.timeline({ defaults: { ease: 'power3.out' } });
@@ -73,9 +113,24 @@ function LandingPage() {
               {/* Search / Input Bar */}
               <div className="w-full max-w-[800px] mt-4 search-container">
                 <div className="flex w-full items-center rounded-full bg-[#0d1f24]/80 backdrop-blur-xl shadow-[0_4px_40px_rgba(6,208,249,0.1)] border border-slate-700/50 hover:border-primary/40 transition-all duration-300 p-1.5 pl-4 md:pl-5 h-14 md:h-16">
+                  <input
+                    type="file"
+                    ref={fileInputRef}
+                    onChange={handleFileChange}
+                    accept="application/pdf"
+                    className="hidden"
+                  />
                   <div className="flex items-center gap-2 pr-3 border-r border-slate-700/50">
-                    <button aria-label="Attach Paper" className="text-slate-500 hover:text-primary transition-colors">
-                      <span className="material-symbols-outlined text-[22px]">attach_file</span>
+                    <button
+                      aria-label="Attach Paper"
+                      onClick={() => fileInputRef.current.click()}
+                      disabled={isUploading}
+                      className={`transition-colors ${isUploading ? 'text-primary animate-pulse' : 'text-slate-500 hover:text-primary'}`}
+                      title={selectedFileName || "Upload Research Paper (PDF)"}
+                    >
+                      <span className="material-symbols-outlined text-[22px]">
+                        {isUploading ? 'sync' : 'attach_file'}
+                      </span>
                     </button>
                     <button aria-label="Voice input" className="text-slate-500 hover:text-primary transition-colors">
                       <span className="material-symbols-outlined text-[22px]">mic</span>

@@ -8,3 +8,9 @@ tmp/
 .vscode/
 package-lock.json
 yarn.lock
+
+# Backend Generated Assets
+backend/public/generated-images/
+backend/public/generated-videos/
+backend/debug.log
+backend/processes.txt
